@@ -73,6 +73,14 @@ pub mod agent;
 #[cfg_attr(target_os = "windows", path = "win/mod.rs")]
 mod platform;
 pub use platform::Enigo;
+/// A Wayland output, as reported by [`Enigo::outputs`].
+#[cfg(all(
+    unix,
+    not(target_os = "macos"),
+    feature = "platform_specific",
+    feature = "wayland"
+))]
+pub use platform::Output;
 
 mod keycodes;
 /// Contains the available keycodes

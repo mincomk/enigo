@@ -35,11 +35,43 @@ use crate::{
 
 pub type Keycode = u32;
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Default)]
 struct OutputInfo {
+    name: String,
+    description: String,
     width: i32,
     height: i32,
     transform: bool,
+}
+
+impl OutputInfo {
+    /// The extent `motion_absolute` maps a position into, with the transform applied.
+    fn extent(&self) -> (i32, i32) {
+        if self.transform {
+            (self.height, self.width)
+        } else {
+            (self.width, self.height)
+        }
+    }
+}
+
+/// An output the compositor advertised.
+///
+/// `name` is the connector the compositor reports — `DP-1`, `eDP-1`, `HDMI-A-1` — and is what
+/// [`Enigo::move_mouse_on_output`](crate::Enigo::move_mouse_on_output) matches on. `width` and
+/// `height` are the current mode in physical pixels, already swapped if the output is rotated, so
+/// they are the extent a position on this output is bounded by.
+///
+/// Only compositors advertising `wl_output` version 4 or later send a name; on an older one it is
+/// empty and `description` is all there is to go on.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[cfg(feature = "platform_specific")]
+#[cfg_attr(docsrs, doc(cfg(feature = "platform_specific")))]
+pub struct Output {
+    pub name: String,
+    pub description: String,
+    pub width: i32,
+    pub height: i32,
 }
 
 pub struct Con {
@@ -271,6 +303,127 @@ impl Con {
         trace!("flushed event queue");
         Ok(())
     }
+
+    /// The outputs the compositor advertised, in the order it advertised them.
+    #[must_use]
+    #[cfg(feature = "platform_specific")]
+    pub fn outputs(&self) -> Vec<Output> {
+        self.state
+            .outputs
+            .iter()
+            .map(|(_, info)| {
+                let (width, height) = info.extent();
+                Output {
+                    name: info.name.clone(),
+                    description: info.description.clone(),
+                    width,
+                    height,
+                }
+            })
+            .collect()
+    }
+
+    /// Move the mouse to a position within one output.
+    ///
+    /// `x` and `y` are output-local: `(0, 0)` is that output's top left corner whatever the
+    /// compositor's arrangement puts there, and they are bounded by the extent
+    /// [`Con::outputs`] reports for it.
+    ///
+    /// This exists because absolute motion under `wlr-virtual-pointer` is output-relative and
+    /// there is no whole-desktop coordinate space to reach a second monitor through.
+    /// [`Mouse::move_mouse`] with [`Coordinate::Abs`] maps into whichever output the pointer was
+    /// created against, so on a multi-monitor layout it can only ever land on one of them. A
+    /// pointer is created per output, on first use, and kept for the life of the connection.
+    ///
+    /// # Errors
+    /// Fails if no output matches `output`, if the position falls outside it, or if the
+    /// compositor's `zwlr_virtual_pointer_manager_v1` is version 1, which cannot bind a pointer
+    /// to an output at all.
+    #[cfg(feature = "platform_specific")]
+    pub fn move_mouse_on_output(&mut self, output: &str, x: i32, y: i32) -> InputResult<()> {
+        let Some((wl_output, info)) = self
+            .state
+            .outputs
+            .iter()
+            .find(|(_, info)| info.name == output)
+            .or_else(|| {
+                self.state
+                    .outputs
+                    .iter()
+                    .find(|(_, info)| info.description == output)
+            })
+        else {
+            error!("no output named {output}");
+            return Err(InputError::InvalidInput("no output has that name"));
+        };
+
+        let (x_extent, y_extent) = info.extent();
+        if x < 0 || y < 0 || x >= x_extent || y >= y_extent {
+            error!("({x}, {y}) is not on the {x_extent}x{y_extent} output {output}");
+            return Err(InputError::InvalidInput(
+                "the coordinates are not on that output",
+            ));
+        }
+        // Checked against the extents above, which are non-negative by construction.
+        #[allow(clippy::cast_sign_loss)]
+        let (x, y, x_extent, y_extent) = (x as u32, y as u32, x_extent as u32, y_extent as u32);
+
+        let name = info.name.clone();
+        let wl_output = wl_output.clone();
+
+        let time = self.get_time();
+        // Cloning the proxy rather than holding the borrow: it is a refcounted handle to the same
+        // compositor object, and keeping the borrow would pin `self` for the rest of the call.
+        let vp = self.output_pointer(&name, &wl_output)?.clone();
+
+        trace!("vp.motion_absolute({time}, {x}, {y}, {x_extent}, {y_extent}) on {output}");
+        vp.motion_absolute(time, x, y, x_extent, y_extent);
+        vp.frame();
+
+        self.flush()
+    }
+
+    /// The virtual pointer bound to one output, created on first use.
+    ///
+    /// Binding is what makes the motion output-relative: `create_virtual_pointer_with_output` asks
+    /// the compositor to map the device to that output, and the extents passed to
+    /// `motion_absolute` are then that output's own.
+    #[cfg(feature = "platform_specific")]
+    fn output_pointer(
+        &mut self,
+        name: &str,
+        wl_output: &WlOutput,
+    ) -> InputResult<&zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1> {
+        if let Some(index) = self
+            .state
+            .output_pointers
+            .iter()
+            .position(|(n, _)| n == name)
+        {
+            return Ok(&self.state.output_pointers[index].1);
+        }
+
+        let Some(manager) = self.state.pointer_manager.as_ref() else {
+            return Err(InputError::Simulate("no way to move the mouse"));
+        };
+        if manager.version() < 2 {
+            error!("zwlr_virtual_pointer_manager_v1 is version 1 and cannot bind to an output");
+            return Err(InputError::Simulate(
+                "the compositor cannot map a virtual pointer to an output",
+            ));
+        }
+
+        let qh = self.event_queue.handle();
+        let vp = manager.create_virtual_pointer_with_output(
+            self.state.seat.as_ref(),
+            Some(wl_output),
+            &qh,
+            (),
+        );
+        debug!("created a virtual pointer bound to the output {name}");
+        self.state.output_pointers.push((name.to_owned(), vp));
+        Ok(&self.state.output_pointers[self.state.output_pointers.len() - 1].1)
+    }
 }
 
 impl Drop for Con {
@@ -283,6 +436,9 @@ impl Drop for Con {
             im.destroy();
         }
         if let Some(vp) = self.state.virtual_pointer.take() {
+            vp.destroy();
+        }
+        for (_, vp) in self.state.output_pointers.drain(..) {
             vp.destroy();
         }
 
@@ -308,6 +464,10 @@ struct WaylandState {
     im_serial: Wrapping<u32>,
     pointer_manager: Option<zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1>,
     virtual_pointer: Option<zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1>,
+    // One per output that `move_mouse_on_output` has been asked for, keyed by connector name.
+    // Absolute motion is only output-relative when the pointer was created against that output,
+    // so there is no sharing a single pointer across a multi-monitor layout.
+    output_pointers: Vec<(String, zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1)>,
     seat: Option<wl_seat::WlSeat>,
     seat_keyboard: Option<WlKeyboard>,
     seat_keymap: Option<Keymap2>,
@@ -722,11 +882,22 @@ impl Dispatch<wl_output::WlOutput, ()> for WaylandState {
                     }
                 }
             }
+            // The connector name, which is how a caller naming an output names it. Sent only by
+            // `wl_output` version 4 and later.
+            wl_output::Event::Name { ref name } => {
+                debug!("WlOutput received event:\n{event:?}");
+                if let Some((_, output_data)) = state.outputs.iter_mut().find(|(o, _)| o == output) {
+                    output_data.name.clone_from(name);
+                }
+            }
+            wl_output::Event::Description { ref description } => {
+                debug!("WlOutput received event:\n{event:?}");
+                if let Some((_, output_data)) = state.outputs.iter_mut().find(|(o, _)| o == output) {
+                    output_data.description.clone_from(description);
+                }
+            }
             // TODO: Check if Scale is relevant
-            wl_output::Event::Done
-            | wl_output::Event::Scale { factor: _ }
-            | wl_output::Event::Name { name: _ }
-            | wl_output::Event::Description { description: _ } => {
+            wl_output::Event::Done | wl_output::Event::Scale { factor: _ } => {
                 trace!("WlOutput received irrelevant event:\n{event:?}");
             }
             _ => warn!("WlOutput received unknown event:\n{event:?}"),
@@ -1021,11 +1192,7 @@ impl Mouse for Con {
         // TODO: The assumption here is that the output we store in the first position
         // is the main display. This likely can be wrong
         match self.state.outputs.first() {
-            // Switch width and height if the output was transformed
-            Some((_, output_info)) if output_info.transform => {
-                Ok((output_info.height, output_info.width))
-            }
-            Some((_, output_info)) => Ok((output_info.width, output_info.height)),
+            Some((_, output_info)) => Ok(output_info.extent()),
             None => Err(InputError::Simulate("No screens available")),
         }
     }

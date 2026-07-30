@@ -48,6 +48,8 @@ mod libei;
 
 #[cfg(feature = "wayland")]
 mod wayland;
+#[cfg(all(feature = "platform_specific", feature = "wayland"))]
+pub use wayland::Output;
 #[cfg(any(feature = "x11rb", feature = "xdo"))]
 #[cfg_attr(feature = "x11rb", path = "x11rb.rs")]
 #[cfg_attr(not(feature = "x11rb"), path = "xdo.rs")]
@@ -204,6 +206,42 @@ impl Enigo {
     /// Returns a list of all currently pressed keys
     pub fn held(&mut self) -> (Vec<Key>, Vec<u16>) {
         self.held.clone()
+    }
+
+    /// The outputs the Wayland compositor advertised, in the order it advertised them.
+    ///
+    /// Empty when there is no Wayland connection — under X11, or where the compositor offers no
+    /// protocol this backend can use.
+    #[must_use]
+    #[cfg(all(feature = "platform_specific", feature = "wayland"))]
+    #[cfg_attr(docsrs, doc(cfg(all(feature = "platform_specific", feature = "wayland"))))]
+    pub fn outputs(&self) -> Vec<wayland::Output> {
+        self.wayland
+            .as_ref()
+            .map(wayland::Con::outputs)
+            .unwrap_or_default()
+    }
+
+    /// Move the mouse to a position within one output.
+    ///
+    /// `x` and `y` are output-local, bounded by the extent [`Enigo::outputs`] reports. This is the
+    /// only way to reach a second monitor on Wayland: `wlr-virtual-pointer` maps absolute motion
+    /// into the output its pointer was created against, so [`Mouse::move_mouse`] with
+    /// [`Coordinate::Abs`] cannot address a multi-monitor layout however the coordinate is
+    /// expressed.
+    ///
+    /// # Errors
+    /// Fails if there is no Wayland connection, if no output matches `output`, if the position is
+    /// not on it, or if the compositor's `zwlr_virtual_pointer_manager_v1` is too old to bind a
+    /// pointer to an output.
+    #[cfg(all(feature = "platform_specific", feature = "wayland"))]
+    #[cfg_attr(docsrs, doc(cfg(all(feature = "platform_specific", feature = "wayland"))))]
+    pub fn move_mouse_on_output(&mut self, output: &str, x: i32, y: i32) -> InputResult<()> {
+        debug!("\x1b[93mmove_mouse_on_output(output: {output:?}, x: {x:?}, y: {y:?})\x1b[0m");
+        let Some(con) = self.wayland.as_mut() else {
+            return Err(InputError::Simulate("no wayland connection"));
+        };
+        con.move_mouse_on_output(output, x, y)
     }
 
     /// Returns the restore token from the portal session when using `libei` or
