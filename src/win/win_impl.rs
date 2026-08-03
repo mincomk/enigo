@@ -1,6 +1,7 @@
 use std::mem::size_of;
 
 use log::{debug, error, info, warn};
+use windows::core::BOOL;
 use windows::Win32::Foundation::POINT;
 use windows::Win32::UI::{
     Input::KeyboardAndMouse::{
@@ -9,8 +10,8 @@ use windows::Win32::UI::{
         MAP_VIRTUAL_KEY_TYPE, MAPVK_VK_TO_VSC_EX, MAPVK_VSC_TO_VK_EX, MOUSE_EVENT_FLAGS,
         MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
         MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
-        MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT,
-        MapVirtualKeyExW, SendInput, VIRTUAL_KEY,
+        MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
+        MOUSEEVENTF_XUP, MOUSEINPUT, MapVirtualKeyExW, SendInput, VIRTUAL_KEY,
     },
     WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId},
 };
@@ -19,7 +20,22 @@ use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE, SetThreadDpiAwarenessContext,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN, WHEEL_DELTA,
+    GetCursorPos, GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CXSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN,
+    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WHEEL_DELTA,
+};
+
+#[cfg(feature = "platform_specific")]
+use windows::Win32::{
+    Devices::Display::{
+        DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
+        DISPLAYCONFIG_DEVICE_INFO_HEADER, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO,
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME, DISPLAYCONFIG_TARGET_DEVICE_NAME, DisplayConfigGetDeviceInfo,
+        GetDisplayConfigBufferSizes, QDC_ONLY_ACTIVE_PATHS, QueryDisplayConfig,
+    },
+    Foundation::{LPARAM, RECT},
+    Graphics::Gdi::{
+        EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
+    },
 };
 
 use crate::{
@@ -571,6 +587,68 @@ impl Enigo {
         self.dw_extra_info
     }
 
+    /// Move the mouse to a position within one monitor, addressing it by the same
+    /// identifiers the screen backend reports: the `HMONITOR` value as a decimal
+    /// `u32` (what xcap's `Monitor::id()` returns on Windows), the GDI device name
+    /// (`\\.\DISPLAY1`), or the monitor's friendly name (e.g. `DELL U2720Q`).
+    ///
+    /// `x` and `y` are monitor-local **physical** pixels, bounded by the monitor's
+    /// extent. This is the Windows counterpart of the wlroots per-output pointer:
+    /// `SendInput`'s absolute space spans the whole virtual desktop, so the
+    /// monitor's origin is added to reach it.
+    ///
+    /// # Errors
+    /// Fails if no monitor matches `output`, if the position is not on it, or if
+    /// the virtual desktop dimensions cannot be read.
+    #[cfg(feature = "platform_specific")]
+    pub fn move_mouse_on_output(&mut self, output: &str, x: i32, y: i32) -> InputResult<()> {
+        debug!("\x1b[93mmove_mouse_on_output(output: {output:?}, x: {x:?}, y: {y:?})\x1b[0m");
+        let monitors = enumerate_monitors()?;
+        let monitor = monitors
+            .iter()
+            .find(|monitor| monitor.matches(output))
+            .ok_or(InputError::InvalidInput("no monitor has that id or name"))?;
+        let width = monitor.bounds.right - monitor.bounds.left;
+        let height = monitor.bounds.bottom - monitor.bounds.top;
+        if x < 0 || y < 0 || x >= width || y >= height {
+            return Err(InputError::InvalidInput("the position is not on the monitor"));
+        }
+        let x = monitor.bounds.left + x;
+        let y = monitor.bounds.top + y;
+        self.move_mouse_virtual(x, y)
+    }
+
+    /// Move to an absolute position in the virtual desktop.
+    ///
+    /// Unlike [`Mouse::move_mouse`] with [`Coordinate::Abs`] — which normalizes
+    /// against the primary monitor — this normalizes over the whole virtual
+    /// desktop (`SM_XVIRTUALSCREEN` … `SM_CXVIRTUALSCREEN`) and sets
+    /// `MOUSEEVENTF_VIRTUALDESK`, so monitors left of or above the primary one
+    /// (negative origins) are reachable.
+    #[cfg(feature = "platform_specific")]
+    fn move_mouse_virtual(&mut self, x: i32, y: i32) -> InputResult<()> {
+        let _dpi_guard = ThreadDpiAwarenessGuard::per_monitor();
+        let vx = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
+        let vy = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
+        let vw = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
+        let vh = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
+        if vw <= 1 || vh <= 1 {
+            return Err(InputError::Simulate("could not get the virtual desktop dimensions"));
+        }
+        let w = i64::from(vw - 1);
+        let h = i64::from(vh - 1);
+        let x = (i64::from(x - vx) * 65535 + w / 2 * (x - vx).signum() as i64) / w;
+        let y = (i64::from(y - vy) * 65535 + h / 2 * (y - vy).signum() as i64) / h;
+        let input = mouse_event(
+            MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+            0,
+            x as i32,
+            y as i32,
+            self.dw_extra_info,
+        );
+        send_input(&[input])
+    }
+
     /// Returns true if the scan code represents an extended key.
     /// Extended keys have the prefix 0xE0 (or 0xE1).
     fn is_extended_key_sc(scan_code: u16) -> bool {
@@ -635,4 +713,152 @@ impl Drop for Enigo {
         }
         debug!("released all held keys");
     }
+}
+
+#[cfg(feature = "platform_specific")]
+fn u16_trimmed(buf: &[u16]) -> String {
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    String::from_utf16_lossy(&buf[..len])
+}
+
+/// One monitor on the virtual desktop, enough to resolve `move_mouse_on_output`'s
+/// output argument and translate monitor-local coordinates to absolute ones.
+#[cfg(feature = "platform_specific")]
+struct WinMonitor {
+    handle: u32,           // HMONITOR value as u32 — what xcap reports as `Monitor::id()` on Windows
+    device_name: String,   // e.g. `\\.\DISPLAY1`
+    friendly_name: String, // e.g. `DELL U2720Q` (via DisplayConfig), may be empty
+    bounds: RECT,          // rcMonitor, in virtual-desktop coordinates (physical pixels)
+}
+
+#[cfg(feature = "platform_specific")]
+impl WinMonitor {
+    fn matches(&self, output: &str) -> bool {
+        // zyris identifies a display by xcap's `id()` first — on Windows that is the
+        // HMONITOR value as a decimal u32.
+        if output == self.handle.to_string() {
+            return true;
+        }
+        let device = self.device_name.trim_start_matches("\\\\.\\");
+        let output = output.trim_start_matches("\\\\.\\");
+        output.eq_ignore_ascii_case(device)
+            || output.eq_ignore_ascii_case(&self.friendly_name)
+            || output.eq_ignore_ascii_case(&format!("Unknown Monitor {}", self.handle))
+    }
+}
+
+#[cfg(feature = "platform_specific")]
+unsafe extern "system" fn monitor_enum_proc(
+    hmonitor: HMONITOR,
+    _hdc: HDC,
+    _rect: *mut RECT,
+    lparam: LPARAM,
+) -> BOOL {
+    let monitors = unsafe { &mut *(lparam.0 as *mut Vec<HMONITOR>) };
+    monitors.push(hmonitor);
+    BOOL(1)
+}
+
+#[cfg(feature = "platform_specific")]
+fn monitor_from_handle(handle: HMONITOR) -> Option<WinMonitor> {
+    let mut info = MONITORINFOEXW {
+        monitorInfo: MONITORINFO {
+            cbSize: size_of::<MONITORINFOEXW>() as u32,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let ok = unsafe { GetMonitorInfoW(handle, (&raw mut info).cast::<MONITORINFO>()) };
+    if !ok.as_bool() {
+        return None;
+    }
+    let device_name = u16_trimmed(&info.szDevice);
+    let friendly_name = friendly_name(&info.szDevice).unwrap_or_default();
+    Some(WinMonitor {
+        handle: handle.0 as u32,
+        device_name,
+        friendly_name,
+        bounds: info.monitorInfo.rcMonitor,
+    })
+}
+
+/// The EDID-derived friendly name of the monitor whose GDI device is `sz_device`
+/// (e.g. `DELL U2720Q`), via `QueryDisplayConfig`. This is what xcap's
+/// `Monitor::friendly_name()` returns on Windows, so it is what zyris passes as
+/// `Display::name`.
+#[cfg(feature = "platform_specific")]
+fn friendly_name(sz_device: &[u16; 32]) -> Option<String> {
+    unsafe {
+        let mut num_paths = 0u32;
+        let mut num_modes = 0u32;
+        if GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &raw mut num_paths, &raw mut num_modes).0 != 0 {
+            return None;
+        }
+        let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); num_paths as usize];
+        let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); num_modes as usize];
+        if QueryDisplayConfig(
+            QDC_ONLY_ACTIVE_PATHS,
+            &raw mut num_paths,
+            paths.as_mut_ptr(),
+            &raw mut num_modes,
+            modes.as_mut_ptr(),
+            None,
+        )
+        .0
+            != 0
+        {
+            return None;
+        }
+        for path in paths {
+            let mut source = DISPLAYCONFIG_SOURCE_DEVICE_NAME {
+                header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
+                    r#type: DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+                    size: size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32,
+                    adapterId: path.sourceInfo.adapterId,
+                    id: path.sourceInfo.id,
+                },
+                ..Default::default()
+            };
+            if DisplayConfigGetDeviceInfo(&raw mut source.header) != 0 {
+                continue;
+            }
+            if source.viewGdiDeviceName != *sz_device {
+                continue;
+            }
+            let mut target = DISPLAYCONFIG_TARGET_DEVICE_NAME {
+                header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
+                    r#type: DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
+                    size: size_of::<DISPLAYCONFIG_TARGET_DEVICE_NAME>() as u32,
+                    adapterId: path.sourceInfo.adapterId,
+                    id: path.targetInfo.id,
+                },
+                ..Default::default()
+            };
+            if DisplayConfigGetDeviceInfo(&raw mut target.header) != 0 {
+                continue;
+            }
+            let name = u16_trimmed(&target.monitorFriendlyDeviceName);
+            if !name.is_empty() {
+                return Some(name);
+            }
+        }
+        None
+    }
+}
+
+#[cfg(feature = "platform_specific")]
+fn enumerate_monitors() -> InputResult<Vec<WinMonitor>> {
+    let mut handles: Vec<HMONITOR> = Vec::new();
+    let ok = unsafe {
+        EnumDisplayMonitors(
+            None,
+            None,
+            Some(monitor_enum_proc),
+            LPARAM(&raw mut handles as isize),
+        )
+    };
+    if !ok.as_bool() {
+        return Err(InputError::Simulate("could not enumerate the monitors"));
+    }
+    Ok(handles.into_iter().filter_map(monitor_from_handle).collect())
 }
